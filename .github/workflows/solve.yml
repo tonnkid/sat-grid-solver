@@ -1,0 +1,132 @@
+name: SAT Cube Solver
+
+on:
+  workflow_dispatch:
+    inputs:
+      cnf:
+        description: "CNF filename inside cnf/"
+        required: true
+        default: "instance.cnf"
+      depth:
+        description: "Cube depth - total cubes = 2^depth"
+        required: true
+        default: "10"
+      budget:
+        description: "Wall-clock budget per job (seconds)"
+        required: true
+        default: "900"
+      chunk:
+        description: "Cubes per job"
+        required: true
+        default: "8"
+      jobs:
+        description: "Parallel jobs (max 20)"
+        required: true
+        default: "20"
+      engines:
+        description: "cdcl | sls | cdcl+sls | all"
+        required: true
+        default: "all"
+  push:
+    paths:
+      - "cnf/*.cnf"
+
+concurrency:
+  group: sat-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      ncubes: ${{ steps.gen.outputs.ncubes }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute cube split
+        id: gen
+        env:
+          DEPTH: ${{ github.event.inputs.depth || '10' }}
+          CHUNK: ${{ github.event.inputs.chunk || '8' }}
+          MAXJOBS: ${{ github.event.inputs.jobs || '20' }}
+        run: |
+          TOTAL=$(( 1 << DEPTH ))
+          NEED=$(( (TOTAL + CHUNK - 1) / CHUNK ))
+          N=$(( NEED < MAXJOBS ? NEED : MAXJOBS ))
+          echo "total cubes=$TOTAL chunks=$NEED using jobs=$N"
+          IDX="["
+          for ((i=0;i<N;i++)); do
+            START=$(( i * CHUNK ))
+            [ $i -gt 0 ] && IDX+=","
+            IDX+="{\"start\":$START,\"count\":$CHUNK,\"shard\":$i}"
+          done
+          IDX+="]"
+          echo "matrix={\"include\":$IDX}" >> "$GITHUB_OUTPUT"
+          echo "ncubes=$TOTAL" >> "$GITHUB_OUTPUT"
+
+  solve:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install python-sat
+        run: |
+          python -m pip install --quiet --upgrade pip
+          pip install --quiet 'python-sat[pblib,aiger]'
+          python -c "from pysat.solvers import Cadical195; print('pysat ok')"
+
+      - name: Build Kissat + YalSAT
+        run: |
+          chmod +x build-solvers.sh
+          ./build-solvers.sh
+
+      - name: Show CPU
+        run: |
+          nproc
+          grep -m1 'model name' /proc/cpuinfo || true
+
+      - name: Solve cube slice
+        env:
+          CNF: ${{ github.event.inputs.cnf || 'instance.cnf' }}
+          DEPTH: ${{ github.event.inputs.depth || '10' }}
+          BUDGET: ${{ github.event.inputs.budget || '900' }}
+          ENGINES: ${{ github.event.inputs.engines || 'all' }}
+          SEED: ${{ matrix.start }}
+          KISSAT_BIN: ${{ github.workspace }}/bin/kissat
+          YALSAT_BIN: ${{ github.workspace }}/bin/yalsat
+        run: |
+          mkdir -p out
+          python solve.py \
+            --cnf "cnf/$CNF" \
+            --cube-start ${{ matrix.start }} \
+            --cube-count ${{ matrix.count }} \
+            --depth "$DEPTH" \
+            --budget "$BUDGET" \
+            --engines "$ENGINES" \
+            --seed "$SEED" \
+            --out "out/result_${{ matrix.shard }}.json"
+
+      - name: Show result
+        if: always()
+        run: cat out/result_*.json 2>/dev/null || echo "no result file"
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.shard }}
+          path: out/
+          retention-days: 7
+          if-no-files-found: warn
